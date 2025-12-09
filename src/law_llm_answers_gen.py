@@ -54,7 +54,6 @@ def generate_ollama_answer(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": question},
         ],
-        # not all models respect this, but it's here for completeness
         "options": {"temperature": temperature},
     }
 
@@ -65,7 +64,6 @@ def generate_ollama_answer(
         raise RuntimeError(f"Ollama request failed: {e}") from e
 
     data = resp.json()
-    # Non-streaming chat result: { "message": { "role": "...", "content": "..." }, ... }
     msg = data.get("message", {})
     content = msg.get("content", "")
     return content.strip()
@@ -78,7 +76,7 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default="llama3",
+        default="mistral",
         help="Ollama model name (must be pulled already, e.g. llama3, mistral, qwen2).",
     )
     parser.add_argument(
@@ -137,11 +135,12 @@ def main():
         f"of {len(items)} total examples, using Ollama model: {args.model}"
     )
 
+    # UPDATED: We use flush() to ensure data is saved immediately
     with output_file.open("a", encoding="utf-8") as fout:
         for i in tqdm(range(start_idx, len(items)), desc="Generating", unit="q"):
             item = items[i]
             question = item["question"]
-            reference_answer = item["reference_answer"]
+            reference_answer = item.get("reference_answer", item.get("answer", ""))
 
             try:
                 # Good (reliable) answer
@@ -164,7 +163,7 @@ def main():
 
             except Exception as e:
                 print(f"\nError on example {i}: {e}")
-                print("Skipping this example.\n")
+                print("Skipping this example (will retry on next run).\n")
                 continue
 
             record = {
@@ -175,7 +174,9 @@ def main():
                 "source_model": args.model,
             }
 
+            # WRITE AND SAVE IMMEDIATELY
             fout.write(json.dumps(record, ensure_ascii=False) + "\n")
+            fout.flush()  # <--- This is the safety checkpoint!
 
     print(f"\nDone. Saved LLM answers to: {output_file.resolve()}")
 
