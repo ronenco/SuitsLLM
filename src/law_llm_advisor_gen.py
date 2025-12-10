@@ -46,7 +46,7 @@ except ImportError as e:
     ) from e
 
 try:
-    from datasets import Dataset, DatasetDict
+    from datasets import Dataset, DatasetDict, Value
 except ImportError as e:
     raise SystemExit(
         "datasets is required for law_llm_advisor_gen.py.\n"
@@ -71,8 +71,8 @@ OUTPUT_DIR = Path("models") / "law_llm_advisor"
 # Glob pattern for your JSONL files (adjust if needed)
 JSONL_PATTERN = "law_judge_scores_*.jsonl"
 
-# Default base model for scoring (change as you like)
-DEFAULT_MODEL_NAME = "microsoft/deberta-v3-base"
+# Default base model for scoring (smaller model is friendlier for M1 memory)
+DEFAULT_MODEL_NAME = "distilroberta-base"
 
 # Random seed for splits / training reproducibility
 RANDOM_SEED = 42
@@ -268,8 +268,8 @@ def tokenize_datasets(
         )
 
     tokenized = datasets.map(_tokenize, batched=True, remove_columns=["text"])
-    # Make sure label is float32 for regression
-    tokenized = tokenized.cast_column("label", "float32")
+    # Make sure label is float32 for regression (datasets 4.4.1 expects a Feature, not a string)
+    tokenized = tokenized.cast_column("label", Value("float32"))
     return tokenized
 
 
@@ -325,6 +325,8 @@ def train_law_llm_advisor(
     batch_size: int = 8,
     max_length: int = 1024,
     output_dir: Path = OUTPUT_DIR,
+    gradient_accumulation_steps: int = 1,
+    use_gradient_checkpointing: bool = False,
 ) -> None:
     """Train a regression-based scoring model on the law judge dataset.
 
@@ -356,26 +358,27 @@ def train_law_llm_advisor(
         num_labels=1,                # regression
         problem_type="regression",  # hint to HF
     )
+    # Optionally enable gradient checkpointing to trade compute for memory
+    if use_gradient_checkpointing:
+        try:
+            model.gradient_checkpointing_enable()
+            print("[MODEL] Gradient checkpointing enabled.")
+        except Exception as e:
+            print(f"[MODEL] Could not enable gradient checkpointing: {e}")
 
     # 5. Tokenize
     tokenized = tokenize_datasets(datasets, tokenizer, max_length=max_length)
 
-    # 6. Training args
+    # 6. Training args (only use arguments supported by older transformers)
     training_args = TrainingArguments(
         output_dir=str(output_dir),
         num_train_epochs=num_train_epochs,
         learning_rate=learning_rate,
         per_device_train_batch_size=batch_size,
         per_device_eval_batch_size=batch_size,
-        evaluation_strategy="epoch",
-        save_strategy="epoch",
-        load_best_model_at_end=True,
-        metric_for_best_model="pearson" if pearsonr is not None else "rmse",
-        greater_is_better=True if pearsonr is not None else False,
+        gradient_accumulation_steps=gradient_accumulation_steps,
         logging_steps=50,
-        save_total_limit=2,
         seed=RANDOM_SEED,
-        report_to=["none"],  # disable wandb etc. by default
     )
 
     # 7. Trainer
@@ -413,11 +416,15 @@ def train_law_llm_advisor(
 
 if __name__ == "__main__":
     # Minimal CLI-style entry: adjust parameters here or wire up argparse.
+    # On M1/M2 with limited GPU memory, we use a smaller batch size and shorter sequences
+    # to avoid MPS "Insufficient Memory" errors.
     train_law_llm_advisor(
         model_name=DEFAULT_MODEL_NAME,
-        use_reference=True,   # set False if you want to ignore reference answers
+        use_reference=True,       # set False if you want to ignore reference answers
         num_train_epochs=3.0,
         learning_rate=2e-5,
-        batch_size=4,         # reduce if you hit OOM; increase if you have GPU memory
-        max_length=1024,
+        batch_size=2,             # smaller batch to fit in memory
+        max_length=512,           # shorter sequences -> much lower memory per sample
+        gradient_accumulation_steps=4,   # effective batch = 2 * 4 = 8
+        use_gradient_checkpointing=True, # further reduce activation memory
     )
