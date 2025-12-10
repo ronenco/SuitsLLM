@@ -15,7 +15,7 @@ from __future__ import annotations
 # }
 #
 # High-level pipeline in this file:
-# 1. Load all JSONL files that match a pattern (e.g. law_judge_dataset_*.jsonl).
+# 1. Load all JSONL files that match a pattern (e.g. law_judge_scores_*.jsonl).
 # 2. Filter out rows without labels.
 # 3. Split by *question* into train/val/test.
 # 4. Build HuggingFace Datasets-style objects with a regression label.
@@ -423,7 +423,7 @@ if __name__ == "__main__":
         use_reference=True,       # set False if you want to ignore reference answers
         num_train_epochs=3.0,
         learning_rate=2e-5,
-        batch_size=2,             # smaller batch to fit in memory
+        batch_size=8,             # smaller batch to fit in memory
         max_length=512,           # shorter sequences -> much lower memory per sample
         gradient_accumulation_steps=4,   # effective batch = 2 * 4 = 8
         use_gradient_checkpointing=True, # further reduce activation memory
