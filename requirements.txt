@@ -1,5 +1,10 @@
+datasets
+scipy
+transformers
+numpy
 beautifulsoup4==4.14.3
 httpx==0.28.1
 tqdm==4.67.1
 openai==2.9.0
 google-generativeai==0.8.5
+torch==2.9.1
