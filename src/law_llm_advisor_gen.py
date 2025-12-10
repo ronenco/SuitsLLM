@@ -1,20 +1,4 @@
-# This is a file used to generate the LLM Advisor.
-# To train it, we use the generate law_qa_scores.json (still wip) that has several 
-# good answers and bad answers and it learn to generate a grad for each answer. 
-# For this model we have the following options:
-# Say options:
-
-# RAG Implmentation?
-# Using some training for the model?
-#  - Parameters for training?
-
-# Import:
-from pathlib import Path
-
-# Our data is located here:
-
-DATA_DIR = Path("data")
-PROCESSED_DIR = DATA_DIR / "processed"
+from __future__ import annotations
 
 # This is a file used to generate and train the LLM Advisor (a scoring model).
 # The goal: given (question, llm_answer) (optionally reference_answer), predict a
@@ -38,7 +22,6 @@ PROCESSED_DIR = DATA_DIR / "processed"
 # 5. Fine-tune a base model (e.g. DeBERTa/BERT) with a regression head.
 # 6. Save the model + tokenizer and print basic evaluation metrics.
 
-from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -86,7 +69,7 @@ PROCESSED_DIR = DATA_DIR / "processed"
 OUTPUT_DIR = Path("models") / "law_llm_advisor"
 
 # Glob pattern for your JSONL files (adjust if needed)
-JSONL_PATTERN = "law_judge_dataset_*.jsonl"
+JSONL_PATTERN = "law_judge_scores_*.jsonl"
 
 # Default base model for scoring (change as you like)
 DEFAULT_MODEL_NAME = "microsoft/deberta-v3-base"
