@@ -1,0 +1,43 @@
+# --------------------
+# Core ML / HF stack
+# --------------------
+transformers>=4.40.0
+datasets>=2.18.0
+accelerate>=0.28.0
+beautifulsoup4==4.14.3
+httpx==0.28.1
+tqdm==4.67.1
+openai==2.9.0
+google-generativeai==0.8.5
+
+# --------------------
+# PyTorch (Metal/MPS)
+# --------------------
+torch>=2.1.0
+torchvision>=0.16.0
+torchaudio>=2.1.0
+
+# --------------------
+# Numerical & metrics
+# --------------------
+numpy>=1.24.0
+scipy>=1.10.0
+scikit-learn>=1.4.0
+
+# --------------------
+# Performance & utils
+# --------------------
+tqdm>=4.66.0
+tokenizers>=0.15.0
+sentencepiece>=0.1.99
+
+# --------------------
+# Logging / debugging
+# --------------------
+tensorboard>=2.15.0
+rich>=13.7.0
+
+# --------------------
+# macOS compatibility
+# --------------------
+psutil>=5.9.0
