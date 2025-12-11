@@ -406,15 +406,54 @@ def run_cli() -> None:
 
     for backend in backends:
         print(f"\n[LLM] Generating answer with backend: {backend} ...")
-        answer = generate_with_llm(backend, question)
+
+        # Try to generate an answer with the selected backend.
+        try:
+            answer = generate_with_llm(backend, question)
+        except Exception as e:
+            msg = str(e)
+            print(f"[WARN] Backend '{backend}' failed to generate an answer: {msg}")
+
+            # Heuristic: if this looks like a quota/limit issue, make it explicit.
+            lower_msg = msg.lower()
+            if (
+                "insufficient_quota" in lower_msg
+                or "exceeded your current quota" in lower_msg
+                or "quota" in lower_msg
+                or "rate limit" in lower_msg
+                or "429" in lower_msg
+            ):
+                print(
+                    f"[WARN] It looks like the quota or rate limits for backend '{backend}' "
+                    f"have been exhausted or restricted. Skipping this backend."
+                )
+
+            # Skip to the next backend instead of aborting the whole run.
+            continue
+
         print(f"\n[LLM:{backend}] Answer:\n{'-' * 40}\n{answer}\n{'-' * 40}")
 
-        score = advisor.score(question, answer)
-        results.append((backend, answer, score))
+        # Try to score the answer with the advisor.
+        try:
+            score = advisor.score(question, answer)
+        except Exception as e:
+            print(
+                f"[WARN] Advisor failed to score the answer from backend '{backend}': {e}. "
+                "Skipping this backend in the aggregated results."
+            )
+            continue
 
+        results.append((backend, answer, score))
         print(f"[ADVISOR] {backend} answer scored as {score:.3f} (0 = worst, 1 = best)\n")
 
     if mode == "best":
+        if not results:
+            print(
+                "\n[ERROR] No successful LLM answers were generated. "
+                "Please check your configuration, API keys, or provider quotas."
+            )
+            return
+
         # Pick the answer with the highest score
         results_sorted = sorted(
             results,
