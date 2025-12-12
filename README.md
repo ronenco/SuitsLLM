@@ -20,8 +20,8 @@ Below is the full flow, with the main script and output for each stage.
 
 1. **Download Q&A from a network source**  
    Script: `src/law_qa_prep.py`  
-   - Fetches raw law questions + answers from an external source (e.g., Q&A site / API).
-   - Extracts the raw JSONL dump into `data/processed`.
+   - Fetches raw law questions + answers from an external source.
+   - Extracts the raw XML dump into `data/raw`.
 
 2. **Keep only the accepted answer per question**  
    Script: `src/law_qa_prep.py`  
@@ -62,7 +62,7 @@ Below is the full flow, with the main script and output for each stage.
        "question": "...",
        "reference_answer": "...",
        "llm_answer": "...",
-       "source_model": "mistral",
+       "source_model": "mistral",   // or qwen / llama / etc.
        "answer_type": "good" | "bad",
        "judge_model": "gpt-4-...",  // or gemini / ollama
        "label": 0.0 | 0.5 | 1.0     // or null if judge failed
@@ -73,7 +73,7 @@ Below is the full flow, with the main script and output for each stage.
    Script: `src/law_llm_advisor_gen.py`  
    Output: `models/law_llm_advisor/` *(not committed)*  
    - Loads all `law_llm_scores_*.jsonl`.
-   - Filters out `label = null`.
+   - Filters out `label = null` and labels outside `[0, 1]` range.
    - Splits by question into **train / validation / test** sets.
    - Fine-tunes a **DistilRoBERTa** regression head (`distilroberta-base`) to predict a **continuous score in `[0, 1]`** for:
      ```text
@@ -264,7 +264,7 @@ python src/law_llm_answers_gen.py \
 
 This will generate something like:
 
-- `data/processed/law_llm_answers.jsonl` (or `law_llm_answers_*.jsonl`)
+- `data/processed/law_llm_answers.jsonl`
 
 #### Step 5: Score answers using judge LLMs
 
@@ -357,7 +357,7 @@ Flow:
 
 ---
 
-## Cointributors:
+## Contributors:
 
 Team project for the AI Law Advisor 
 Contributors:
