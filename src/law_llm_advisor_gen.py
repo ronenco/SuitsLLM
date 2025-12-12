@@ -1,5 +1,13 @@
 from __future__ import annotations
 
+import json
+import random
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Dict, Tuple, Optional
+
+import numpy as np
+
 # This is a file used to generate and train the LLM Advisor (a scoring model).
 # The goal: given (question, llm_answer) (optionally reference_answer), predict a
 # continuous quality score in [0, 1].
@@ -22,22 +30,14 @@ from __future__ import annotations
 # 5. Fine-tune a base model (e.g. DeBERTa/BERT) with a regression head.
 # 6. Save the model + tokenizer and print basic evaluation metrics.
 
-
-from dataclasses import dataclass
-from pathlib import Path
-from typing import List, Dict, Any, Tuple, Optional
-
-import json
-import random
-
-import numpy as np
-
 try:
     from transformers import (
         AutoTokenizer,
         AutoModelForSequenceClassification,
         Trainer,
         TrainingArguments,
+        PreTrainedTokenizerBase,
+        BatchEncoding,
     )
 except ImportError as e:
     raise SystemExit(
@@ -58,7 +58,6 @@ try:
 except ImportError:
     pearsonr = None
     spearmanr = None
-
 
 # ----------------------
 # Paths & configuration
@@ -110,6 +109,8 @@ def load_jsonl_file(path: Path) -> List[LawExample]:
             # Skip unlabeled examples
             if label is None:
                 continue
+            if not (0.0 <= label <= 1.0):
+                continue
 
             question = obj.get("question", "").strip()
             llm_answer = obj.get("llm_answer", "").strip()
@@ -155,10 +156,10 @@ def load_all_examples(processed_dir: Path = PROCESSED_DIR) -> List[LawExample]:
 # -----------------
 
 def split_by_question(
-    examples: List[LawExample],
-    train_ratio: float = 0.7,
-    val_ratio: float = 0.15,
-    seed: int = RANDOM_SEED,
+        examples: List[LawExample],
+        train_ratio: float = 0.7,
+        val_ratio: float = 0.15,
+        seed: int = RANDOM_SEED,
 ) -> Tuple[List[LawExample], List[LawExample], List[LawExample]]:
     """Split examples into train/val/test, grouped by question.
 
@@ -177,8 +178,8 @@ def split_by_question(
     n_val = int(val_ratio * n)
 
     train_qs = set(questions[:n_train])
-    val_qs = set(questions[n_train : n_train + n_val])
-    test_qs = set(questions[n_train + n_val :])
+    val_qs = set(questions[n_train: n_train + n_val])
+    test_qs = set(questions[n_train + n_val:])
 
     train_examples: List[LawExample] = []
     val_examples: List[LawExample] = []
@@ -213,26 +214,26 @@ def build_input_text(example: LawExample, use_reference: bool = False) -> str:
     """
     if use_reference and example.reference_answer:
         return (
-            "You are a law professor grading student answers.\n"  # instruction helps alignment
-            "Consider the question, the reference answer, and the student's answer.\n\n"
-            "[QUESTION]\n" + example.question + "\n\n"
-            "[REFERENCE_ANSWER]\n" + example.reference_answer + "\n\n"
-            "[STUDENT_ANSWER]\n" + example.llm_answer
+                "You are a law professor grading student answers.\n"  # instruction helps alignment
+                "Consider the question, the reference answer, and the student's answer.\n\n"
+                "[QUESTION]\n" + example.question + "\n\n"
+                "[REFERENCE_ANSWER]\n" + example.reference_answer + "\n\n"
+                "[STUDENT_ANSWER]\n" + example.llm_answer
         )
     else:
         return (
-            "You are a law professor grading student answers.\n"  # instruction helps alignment
-            "Consider the question and the student's answer.\n\n"
-            "[QUESTION]\n" + example.question + "\n\n"
-            "[STUDENT_ANSWER]\n" + example.llm_answer
+                "You are a law professor grading student answers.\n"  # instruction helps alignment
+                "Consider the question and the student's answer.\n\n"
+                "[QUESTION]\n" + example.question + "\n\n"
+                "[STUDENT_ANSWER]\n" + example.llm_answer
         )
 
 
 def to_hf_dataset(
-    train_examples: List[LawExample],
-    val_examples: List[LawExample],
-    test_examples: List[LawExample],
-    use_reference: bool = False,
+        train_examples: List[LawExample],
+        val_examples: List[LawExample],
+        test_examples: List[LawExample],
+        use_reference: bool = False,
 ) -> DatasetDict:
     """Convert splits into a HuggingFace DatasetDict."""
 
@@ -255,11 +256,13 @@ def to_hf_dataset(
 # -----------------
 
 def tokenize_datasets(
-    datasets: DatasetDict,
-    tokenizer: AutoTokenizer,
-    max_length: int = 1024,
+        datasets: DatasetDict,
+        tokenizer: PreTrainedTokenizerBase,
+        max_length: int = 1024,
 ) -> DatasetDict:
-    def _tokenize(batch: Dict[str, List[str]]) -> Dict[str, Any]:
+    max_length = min(max_length, tokenizer.model_max_length)
+
+    def _tokenize(batch: Dict[str, List[str]]) -> BatchEncoding:
         return tokenizer(
             batch["text"],
             truncation=True,
@@ -318,15 +321,22 @@ def compute_metrics(eval_pred) -> Dict[str, float]:
 # -----------------
 
 def train_law_llm_advisor(
-    model_name: str = DEFAULT_MODEL_NAME,
-    use_reference: bool = False,
-    num_train_epochs: float = 3.0,
-    learning_rate: float = 2e-5,
-    batch_size: int = 8,
-    max_length: int = 1024,
-    output_dir: Path = OUTPUT_DIR,
-    gradient_accumulation_steps: int = 1,
-    use_gradient_checkpointing: bool = False,
+        model_name: str = DEFAULT_MODEL_NAME,
+        use_reference: bool = False,
+        num_train_epochs: float = 3.0,
+        learning_rate: float = 2e-5,
+        batch_size: int = 8,
+        max_length: int = 1024,
+        output_dir: Path = OUTPUT_DIR,
+        gradient_accumulation_steps: int = 1,
+        use_gradient_checkpointing: bool = False,
+        evaluation_strategy="epoch",
+        save_strategy="epoch",
+        load_best_model_at_end=True,
+        metric_for_best_model="rmse",
+        greater_is_better=False,
+        weight_decay=0.01,
+        warmup_ratio=0.05
 ) -> None:
     """Train a regression-based scoring model on the law judge dataset.
 
@@ -355,7 +365,7 @@ def train_law_llm_advisor(
 
     model = AutoModelForSequenceClassification.from_pretrained(
         model_name,
-        num_labels=1,                # regression
+        num_labels=1,  # regression
         problem_type="regression",  # hint to HF
     )
     # Optionally enable gradient checkpointing to trade compute for memory
@@ -377,6 +387,13 @@ def train_law_llm_advisor(
         per_device_train_batch_size=batch_size,
         per_device_eval_batch_size=batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
+        eval_strategy=evaluation_strategy,
+        save_strategy=save_strategy,
+        load_best_model_at_end=load_best_model_at_end,
+        metric_for_best_model=metric_for_best_model,
+        greater_is_better=greater_is_better,
+        weight_decay=weight_decay,
+        warmup_ratio=warmup_ratio,
         logging_steps=50,
         seed=RANDOM_SEED,
     )
@@ -420,11 +437,11 @@ if __name__ == "__main__":
     # to avoid MPS "Insufficient Memory" errors.
     train_law_llm_advisor(
         model_name=DEFAULT_MODEL_NAME,
-        use_reference=True,       # set False if you want to ignore reference answers
+        use_reference=True,  # set False if you want to ignore reference answers
         num_train_epochs=3.0,
         learning_rate=2e-5,
-        batch_size=8,             # smaller batch to fit in memory
-        max_length=512,           # shorter sequences -> much lower memory per sample
-        gradient_accumulation_steps=4,   # effective batch = 2 * 4 = 8
-        use_gradient_checkpointing=True, # further reduce activation memory
+        batch_size=2,  # smaller batch to fit in memory
+        max_length=512,  # shorter sequences -> much lower memory per sample
+        gradient_accumulation_steps=4,  # effective batch = 2 * 4 = 8
+        use_gradient_checkpointing=True,  # further reduce activation memory
     )
