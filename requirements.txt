@@ -1,10 +1,11 @@
-datasets
-scipy
-transformers
-numpy
 beautifulsoup4==4.14.3
+datasets==4.4.1
 httpx==0.28.1
+numpy==2.3.5
+openai==2.11.0
+protobuf==6.33.2
+scipy==1.16.3
 tqdm==4.67.1
-openai==2.9.0
-google-generativeai==0.8.5
-torch==2.9.1
+transformers==4.57.3
+torch==2.9.1 # for GPU support install pytorch separately, checkout https://pytorch.org/get-started/locally/
+accelerate==1.12.0
