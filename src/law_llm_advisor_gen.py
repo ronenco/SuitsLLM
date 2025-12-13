@@ -81,8 +81,16 @@ OUTPUT_DIR = Path("models") / "law_llm_advisor"
 # Glob pattern for your JSONL files (adjust if needed)
 JSONL_PATTERN = "law_judge_scores_*.jsonl"
 
+
 # Default base model for scoring (smaller model is friendlier for M1 memory)
 DEFAULT_MODEL_NAME = "distilroberta-base"
+
+# A reasonable long-context default if you want 1024+ tokens.
+# BigBird generally supports up to 4096 tokens and works with standard HF Trainer.
+DEFAULT_LONG_CONTEXT_MODEL_NAME = "google/bigbird-roberta-base"
+
+# If max_length > 512 and the selected model cannot handle it, we can auto-switch.
+AUTO_SWITCH_TO_LONG_CONTEXT = True
 
 # Random seed for splits / training reproducibility
 RANDOM_SEED = 42
@@ -451,13 +459,57 @@ def train_law_llm_advisor(
 
     # 4. Load tokenizer & model
     print(f"[MODEL] Loading base model: {model_name}")
+
+    # If the user requests long sequences (e.g., 1024) but keeps a 512-token model like distilroberta,
+    # training can crash due to positional embedding limits. We can auto-switch to a long-context model.
+    requested_max_length = int(max_length)
+
+    # Peek tokenizer first to estimate supported length. Some tokenizers report huge model_max_length,
+    # so we will later confirm using model.config.max_position_embeddings as the source of truth.
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
+    # Load model next (needed to check positional embedding limits reliably)
     model = AutoModelForSequenceClassification.from_pretrained(
         model_name,
         num_labels=1,  # regression
         problem_type="regression",  # hint to HF
     )
+
+    supported_max = getattr(model.config, "max_position_embeddings", None)
+    if supported_max is None:
+        # Fall back to tokenizer's max length (may be huge for some tokenizers, but better than nothing)
+        supported_max = int(getattr(tokenizer, "model_max_length", requested_max_length))
+
+    # Auto-switch for convenience if user asked for >512 but chose a short-context model.
+    if (
+        AUTO_SWITCH_TO_LONG_CONTEXT
+        and requested_max_length > 512
+        and supported_max <= 512
+        and model_name == DEFAULT_MODEL_NAME
+    ):
+        print(
+            f"[MODEL] Requested max_length={requested_max_length}, but '{model_name}' supports ~{supported_max}. "
+            f"Auto-switching to long-context model: {DEFAULT_LONG_CONTEXT_MODEL_NAME}"
+        )
+        model_name = DEFAULT_LONG_CONTEXT_MODEL_NAME
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModelForSequenceClassification.from_pretrained(
+            model_name,
+            num_labels=1,
+            problem_type="regression",
+        )
+        supported_max = getattr(model.config, "max_position_embeddings", requested_max_length)
+
+    # If requested_max_length is above what the model supports, cap it to avoid indexing errors.
+    if requested_max_length > int(supported_max):
+        print(
+            f"[WARN] Requested max_length={requested_max_length} exceeds model positional limit ({supported_max}). "
+            f"Capping max_length to {supported_max}."
+        )
+        max_length = int(supported_max)
+    else:
+        max_length = requested_max_length
+
     # Optionally enable gradient checkpointing to trade compute for memory
     if use_gradient_checkpointing:
         try:
@@ -530,7 +582,7 @@ if __name__ == "__main__":
         "--model",
         type=str,
         default=DEFAULT_MODEL_NAME,
-        help=f"Base HF model checkpoint to fine-tune. Default: {DEFAULT_MODEL_NAME}",
+        help=f"Base HF model checkpoint to fine-tune. Default: {DEFAULT_MODEL_NAME}. Note: if you request --max-length > 512 with the default model, the script will auto-switch to {DEFAULT_LONG_CONTEXT_MODEL_NAME}.",
     )
     parser.add_argument(
         "--use-reference",
@@ -559,7 +611,7 @@ if __name__ == "__main__":
         "--max-length",
         type=int,
         default=512,
-        help="Tokenizer max_length (tokens). Default: 512",
+        help="Tokenizer max_length (tokens). Use 512 for short-context models; use 1024+ with a long-context model like BigBird/Longformer. Default: 512",
     )
     parser.add_argument(
         "--grad-accum",
