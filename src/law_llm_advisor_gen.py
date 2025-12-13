@@ -30,6 +30,17 @@ import numpy as np
 # 5. Fine-tune a base model (e.g. DeBERTa/BERT) with a regression head.
 # 6. Save the model + tokenizer and print basic evaluation metrics.
 
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Dict, Any, Tuple, Optional
+
+import json
+import random
+
+import numpy as np
+import argparse
+
 try:
     from transformers import (
         AutoTokenizer,
@@ -70,8 +81,16 @@ OUTPUT_DIR = Path("models") / "law_llm_advisor"
 # Glob pattern for your JSONL files (adjust if needed)
 JSONL_PATTERN = "law_judge_scores_*.jsonl"
 
+
 # Default base model for scoring (smaller model is friendlier for M1 memory)
 DEFAULT_MODEL_NAME = "distilroberta-base"
+
+# A reasonable long-context default if you want 1024+ tokens.
+# BigBird generally supports up to 4096 tokens and works with standard HF Trainer.
+DEFAULT_LONG_CONTEXT_MODEL_NAME = "google/bigbird-roberta-base"
+
+# If max_length > 512 and the selected model cannot handle it, we can auto-switch.
+AUTO_SWITCH_TO_LONG_CONTEXT = True
 
 # Random seed for splits / training reproducibility
 RANDOM_SEED = 42
@@ -260,10 +279,86 @@ def to_hf_dataset(
 # Tokenization & model
 # -----------------
 
+def compute_truncation_stats(
+    datasets: DatasetDict,
+    tokenizer: AutoTokenizer,
+    max_length: int,
+    sample_size: Optional[int] = None,
+    seed: int = RANDOM_SEED,
+) -> Dict[str, Dict[str, float]]:
+    """Compute how often inputs would be truncated at `max_length`.
+
+    This is useful to verify whether long answers / references are being cut.
+
+    Returns per-split stats:
+      - total: number of samples measured
+      - truncated: how many exceed max_length
+      - truncated_pct: percent truncated
+      - avg_tokens: average token length
+      - p50_tokens / p90_tokens / p99_tokens: token-length percentiles
+      - avg_over_by: average (tokens - max_length) among truncated samples
+    """
+
+    rng = random.Random(seed)
+    out: Dict[str, Dict[str, float]] = {}
+
+    for split_name in ["train", "validation", "test"]:
+        if split_name not in datasets:
+            continue
+
+        ds = datasets[split_name]
+        n = len(ds)
+        if n == 0:
+            out[split_name] = {
+                "total": 0,
+                "truncated": 0,
+                "truncated_pct": 0.0,
+                "avg_tokens": 0.0,
+                "p50_tokens": 0.0,
+                "p90_tokens": 0.0,
+                "p99_tokens": 0.0,
+                "avg_over_by": 0.0,
+            }
+            continue
+
+        # Optional sampling to keep it fast on large datasets
+        if sample_size is not None and sample_size < n:
+            indices = rng.sample(range(n), k=sample_size)
+        else:
+            indices = list(range(n))
+
+        lengths: List[int] = []
+        for idx in indices:
+            text = ds[idx]["text"]
+            # No truncation here: we want the true length
+            ids = tokenizer(text, truncation=False, add_special_tokens=True)["input_ids"]
+            lengths.append(len(ids))
+
+        arr = np.asarray(lengths, dtype=np.int32)
+        truncated_mask = arr > max_length
+        truncated_count = int(truncated_mask.sum())
+        total = int(arr.size)
+
+        over_by = arr[truncated_mask] - max_length
+        avg_over_by = float(over_by.mean()) if over_by.size else 0.0
+
+        out[split_name] = {
+            "total": float(total),
+            "truncated": float(truncated_count),
+            "truncated_pct": float(100.0 * truncated_count / max(total, 1)),
+            "avg_tokens": float(arr.mean()),
+            "p50_tokens": float(np.percentile(arr, 50)),
+            "p90_tokens": float(np.percentile(arr, 90)),
+            "p99_tokens": float(np.percentile(arr, 99)),
+            "avg_over_by": avg_over_by,
+        }
+
+    return out
+
 def tokenize_datasets(
-        datasets: DatasetDict,
-        tokenizer: PreTrainedTokenizerBase,
-        max_length: int = 1024,
+    datasets: DatasetDict,
+    tokenizer: AutoTokenizer,
+    max_length: int = 1024,
 ) -> DatasetDict:
     max_length = min(max_length, tokenizer.model_max_length)
 
@@ -364,15 +459,62 @@ def train_law_llm_advisor(
     # 3. Build HF datasets
     datasets = to_hf_dataset(train_ex, val_ex, test_ex, use_reference=use_reference)
 
+    # If requested via CLI, you can compute truncation stats before training.
+    # (This function does not change training behavior; it is just diagnostic.)
+
     # 4. Load tokenizer & model
     print(f"[MODEL] Loading base model: {model_name}")
+
+    # If the user requests long sequences (e.g., 1024) but keeps a 512-token model like distilroberta,
+    # training can crash due to positional embedding limits. We can auto-switch to a long-context model.
+    requested_max_length = int(max_length)
+
+    # Peek tokenizer first to estimate supported length. Some tokenizers report huge model_max_length,
+    # so we will later confirm using model.config.max_position_embeddings as the source of truth.
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
+    # Load model next (needed to check positional embedding limits reliably)
     model = AutoModelForSequenceClassification.from_pretrained(
         model_name,
         num_labels=1,  # regression
         problem_type="regression",  # hint to HF
     )
+
+    supported_max = getattr(model.config, "max_position_embeddings", None)
+    if supported_max is None:
+        # Fall back to tokenizer's max length (may be huge for some tokenizers, but better than nothing)
+        supported_max = int(getattr(tokenizer, "model_max_length", requested_max_length))
+
+    # Auto-switch for convenience if user asked for >512 but chose a short-context model.
+    if (
+        AUTO_SWITCH_TO_LONG_CONTEXT
+        and requested_max_length > 512
+        and supported_max <= 512
+        and model_name == DEFAULT_MODEL_NAME
+    ):
+        print(
+            f"[MODEL] Requested max_length={requested_max_length}, but '{model_name}' supports ~{supported_max}. "
+            f"Auto-switching to long-context model: {DEFAULT_LONG_CONTEXT_MODEL_NAME}"
+        )
+        model_name = DEFAULT_LONG_CONTEXT_MODEL_NAME
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModelForSequenceClassification.from_pretrained(
+            model_name,
+            num_labels=1,
+            problem_type="regression",
+        )
+        supported_max = getattr(model.config, "max_position_embeddings", requested_max_length)
+
+    # If requested_max_length is above what the model supports, cap it to avoid indexing errors.
+    if requested_max_length > int(supported_max):
+        print(
+            f"[WARN] Requested max_length={requested_max_length} exceeds model positional limit ({supported_max}). "
+            f"Capping max_length to {supported_max}."
+        )
+        max_length = int(supported_max)
+    else:
+        max_length = requested_max_length
+
     # Optionally enable gradient checkpointing to trade compute for memory
     if use_gradient_checkpointing:
         try:
@@ -437,16 +579,123 @@ def train_law_llm_advisor(
 
 
 if __name__ == "__main__":
-    # Minimal CLI-style entry: adjust parameters here or wire up argparse.
-    # On M1/M2 with limited GPU memory, we use a smaller batch size and shorter sequences
-    # to avoid MPS "Insufficient Memory" errors.
+    parser = argparse.ArgumentParser(
+        description="Train SuitsLLM law advisor (encoder regression judge) and optionally report truncation stats."
+    )
+
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=DEFAULT_MODEL_NAME,
+        help=f"Base HF model checkpoint to fine-tune. Default: {DEFAULT_MODEL_NAME}. Note: if you request --max-length > 512 with the default model, the script will auto-switch to {DEFAULT_LONG_CONTEXT_MODEL_NAME}.",
+    )
+    parser.add_argument(
+        "--use-reference",
+        action="store_true",
+        help="Include reference answers in the input text (recommended).",
+    )
+    parser.add_argument(
+        "--epochs",
+        type=float,
+        default=3.0,
+        help="Number of training epochs. Default: 3.0",
+    )
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=2e-5,
+        help="Learning rate. Default: 2e-5",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=8,
+        help="Per-device batch size. Default: 8",
+    )
+    parser.add_argument(
+        "--max-length",
+        type=int,
+        default=512,
+        help="Tokenizer max_length (tokens). Use 512 for short-context models; use 1024+ with a long-context model like BigBird/Longformer. Default: 512",
+    )
+    parser.add_argument(
+        "--grad-accum",
+        type=int,
+        default=4,
+        help="Gradient accumulation steps. Default: 4",
+    )
+    parser.add_argument(
+        "--grad-checkpoint",
+        action="store_true",
+        help="Enable gradient checkpointing to reduce memory usage.",
+    )
+
+    parser.add_argument(
+        "--token-truncate",
+        action="store_true",
+        help=(
+            "Diagnostic mode: report how many samples would be truncated at --max-length. "
+            "Does not train unless you also pass --train."
+        ),
+    )
+    parser.add_argument(
+        "--token-truncate-sample",
+        type=int,
+        default=None,
+        help="Optional: sample size per split for truncation stats (faster on large datasets).",
+    )
+    parser.add_argument(
+        "--train",
+        action="store_true",
+        help="Actually run training. If omitted, the script will only run diagnostics if requested.",
+    )
+
+    args = parser.parse_args()
+
+    # Always load examples/splits once if diagnostics are requested.
+    if args.token_truncate:
+        # Load data and build the text dataset to measure lengths.
+        examples = load_all_examples(PROCESSED_DIR)
+        train_ex, val_ex, test_ex = split_by_question(examples)
+        ds = to_hf_dataset(train_ex, val_ex, test_ex, use_reference=args.use_reference)
+
+        print(f"[MODEL] Loading tokenizer for: {args.model}")
+        tok = AutoTokenizer.from_pretrained(args.model)
+
+        stats = compute_truncation_stats(
+            datasets=ds,
+            tokenizer=tok,
+            max_length=args.max_length,
+            sample_size=args.token_truncate_sample,
+            seed=RANDOM_SEED,
+        )
+
+        print("\n[TRUNCATION] Token length vs max_length diagnostics")
+        print(f"  max_length = {args.max_length}")
+        if args.token_truncate_sample is not None:
+            print(f"  sample_size per split = {args.token_truncate_sample}")
+
+        for split, s in stats.items():
+            print(
+                f"  - {split}: total={int(s['total'])}, "
+                f"truncated={int(s['truncated'])} ({s['truncated_pct']:.2f}%), "
+                f"avg_tokens={s['avg_tokens']:.1f}, "
+                f"p50={s['p50_tokens']:.0f}, p90={s['p90_tokens']:.0f}, p99={s['p99_tokens']:.0f}, "
+                f"avg_over_by={s['avg_over_by']:.1f}"
+            )
+
+        # If user didn't request training, exit here.
+        if not args.train:
+            raise SystemExit(0)
+
+    # Default behavior: train (matches previous hardcoded defaults, but configurable)
     train_law_llm_advisor(
-        model_name=DEFAULT_MODEL_NAME,
-        use_reference=True,  # set False if you want to ignore reference answers
-        num_train_epochs=3.0,
-        learning_rate=2e-5,
-        batch_size=2,  # smaller batch to fit in memory
-        max_length=512,  # shorter sequences -> much lower memory per sample
-        gradient_accumulation_steps=4,  # effective batch = 2 * 4 = 8
-        use_gradient_checkpointing=True,  # further reduce activation memory
+        model_name=args.model,
+        use_reference=args.use_reference,
+        num_train_epochs=args.epochs,
+        learning_rate=args.learning_rate,
+        batch_size=args.batch_size,
+        max_length=args.max_length,
+        gradient_accumulation_steps=args.grad_accum,
+        use_gradient_checkpointing=args.grad_checkpoint,
     )
