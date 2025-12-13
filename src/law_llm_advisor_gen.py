@@ -109,7 +109,12 @@ def load_jsonl_file(path: Path) -> List[LawExample]:
             # Skip unlabeled examples
             if label is None:
                 continue
-            if not (0.0 <= label <= 1.0):
+            # Skip labels out of range
+            try:
+                label_f = float(label)
+            except (TypeError, ValueError):
+                continue
+            if not (0.0 <= label_f <= 1.0):
                 continue
 
             question = obj.get("question", "").strip()
