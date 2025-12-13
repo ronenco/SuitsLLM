@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import random
 from dataclasses import dataclass
@@ -29,17 +30,6 @@ import numpy as np
 # 4. Build HuggingFace Datasets-style objects with a regression label.
 # 5. Fine-tune a base model (e.g. DeBERTa/BERT) with a regression head.
 # 6. Save the model + tokenizer and print basic evaluation metrics.
-
-
-from dataclasses import dataclass
-from pathlib import Path
-from typing import List, Dict, Any, Tuple, Optional
-
-import json
-import random
-
-import numpy as np
-import argparse
 
 try:
     from transformers import (
@@ -80,7 +70,6 @@ OUTPUT_DIR = Path("models") / "law_llm_advisor"
 
 # Glob pattern for your JSONL files (adjust if needed)
 JSONL_PATTERN = "law_judge_scores_*.jsonl"
-
 
 # Default base model for scoring (smaller model is friendlier for M1 memory)
 DEFAULT_MODEL_NAME = "distilroberta-base"
@@ -241,15 +230,15 @@ def build_input_text(example: LawExample, use_reference: bool = False) -> str:
                 "You are a law professor grading student answers.\n"  # instruction helps alignment
                 "Consider the question, the reference answer, and the student's answer.\n\n"
                 "[QUESTION]\n" + example.question + "\n\n"
-                "[REFERENCE_ANSWER]\n" + example.reference_answer + "\n\n"
-                "[STUDENT_ANSWER]\n" + example.llm_answer
+                                                    "[REFERENCE_ANSWER]\n" + example.reference_answer + "\n\n"
+                                                                                                        "[STUDENT_ANSWER]\n" + example.llm_answer
         )
     else:
         return (
                 "You are a law professor grading student answers.\n"  # instruction helps alignment
                 "Consider the question and the student's answer.\n\n"
                 "[QUESTION]\n" + example.question + "\n\n"
-                "[STUDENT_ANSWER]\n" + example.llm_answer
+                                                    "[STUDENT_ANSWER]\n" + example.llm_answer
         )
 
 
@@ -280,11 +269,11 @@ def to_hf_dataset(
 # -----------------
 
 def compute_truncation_stats(
-    datasets: DatasetDict,
-    tokenizer: AutoTokenizer,
-    max_length: int,
-    sample_size: Optional[int] = None,
-    seed: int = RANDOM_SEED,
+        datasets: DatasetDict,
+        tokenizer: PreTrainedTokenizerBase,
+        max_length: int,
+        sample_size: Optional[int] = None,
+        seed: int = RANDOM_SEED,
 ) -> Dict[str, Dict[str, float]]:
     """Compute how often inputs would be truncated at `max_length`.
 
@@ -355,10 +344,11 @@ def compute_truncation_stats(
 
     return out
 
+
 def tokenize_datasets(
-    datasets: DatasetDict,
-    tokenizer: AutoTokenizer,
-    max_length: int = 1024,
+        datasets: DatasetDict,
+        tokenizer: PreTrainedTokenizerBase,
+        max_length: int = 1024,
 ) -> DatasetDict:
     max_length = min(max_length, tokenizer.model_max_length)
 
@@ -489,9 +479,9 @@ def train_law_llm_advisor(
     # We only do this automatically when the user is using the DEFAULT_MODEL_NAME (distilroberta-base),
     # because long-context models are heavier and should not be forced in other cases.
     if (
-        AUTO_SWITCH_TO_LONG_CONTEXT
-        and requested_max_length > int(supported_max)
-        and model_name == DEFAULT_MODEL_NAME
+            AUTO_SWITCH_TO_LONG_CONTEXT
+            and requested_max_length > int(supported_max)
+            and model_name == DEFAULT_MODEL_NAME
     ):
         print(
             f"[MODEL] Requested max_length={requested_max_length}, but '{model_name}' supports ~{supported_max}. "
