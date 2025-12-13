@@ -485,11 +485,12 @@ def train_law_llm_advisor(
         # Fall back to tokenizer's max length (may be huge for some tokenizers, but better than nothing)
         supported_max = int(getattr(tokenizer, "model_max_length", requested_max_length))
 
-    # Auto-switch for convenience if user asked for >512 but chose a short-context model.
+    # Auto-switch for convenience if the user requested a longer max_length than the selected model can handle.
+    # We only do this automatically when the user is using the DEFAULT_MODEL_NAME (distilroberta-base),
+    # because long-context models are heavier and should not be forced in other cases.
     if (
         AUTO_SWITCH_TO_LONG_CONTEXT
-        and requested_max_length > 512
-        and supported_max <= 512
+        and requested_max_length > int(supported_max)
         and model_name == DEFAULT_MODEL_NAME
     ):
         print(
@@ -660,7 +661,17 @@ if __name__ == "__main__":
         ds = to_hf_dataset(train_ex, val_ex, test_ex, use_reference=args.use_reference)
 
         print(f"[MODEL] Loading tokenizer for: {args.model}")
-        tok = AutoTokenizer.from_pretrained(args.model)
+        # Match training behavior: if user asks for >512 with the default model, measure with the long-context model.
+        diag_model = args.model
+        if AUTO_SWITCH_TO_LONG_CONTEXT and args.max_length > 512 and diag_model == DEFAULT_MODEL_NAME:
+            print(
+                f"[MODEL] Diagnostic requested max_length={args.max_length} with '{diag_model}'. "
+                f"Switching tokenizer to long-context model for diagnostics: {DEFAULT_LONG_CONTEXT_MODEL_NAME}"
+            )
+            diag_model = DEFAULT_LONG_CONTEXT_MODEL_NAME
+        tok = AutoTokenizer.from_pretrained(diag_model)
+        if diag_model != args.model:
+            print(f"[MODEL] Using tokenizer: {diag_model}")
 
         stats = compute_truncation_stats(
             datasets=ds,
