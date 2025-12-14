@@ -91,9 +91,12 @@ Below is the full flow, with the main script and output for each stage.
         - `chatgpt` → OpenAI Chat Completions  
         - `best-of` → call all available backends and choose the best
      2. Prompts you for a **law question**.
-     3. Each selected backend generates an answer using a shared system prompt (law helper).
-     4. The **trained advisor model** (`models/law_llm_advisor/`) scores each answer in `[0, 1]`.
-     5. The CLI prints:
+     3. Choose an **answer style**:
+        - **good** → helpful, conservative legal assistant
+        - **bad** → intentionally misleading / confident-but-wrong (for testing only)
+     4. The selected backend(s) generate answers using the chosen system prompt.
+     5. The **trained advisor model** (`models/law_llm_advisor/`) scores each answer in `[0, 1]`.
+     6. The CLI prints:
         - each answer + its score
         - in `best-of` mode, the answer with the **highest score**.
 
@@ -302,15 +305,88 @@ At this point you have labeled training data: `law_llm_scores_*.jsonl`.
 
 #### Step 6: Train the Law Advisor (regression judge)
 
+This step trains the **local encoder-based judge** that scores answers in `[0, 1]`.
+
+The training script supports both **short-context** (512 tokens) and **long-context** (1024+ tokens) setups. The script will automatically switch to a long-context model (BigBird) if you request a larger `max_length` than the default model supports.
+
+##### Basic training (default settings)
+
 ```bash
-python src/law_llm_advisor_gen.py
+python src/law_llm_advisor_gen.py --train
 ```
 
-This will:
+Defaults:
+- Base model: `distilroberta-base`
+- Max length: `512`
+- Epochs: `3`
+- Regression objective (score in `[0, 1]`)
 
-- load all `data/processed/law_llm_scores_*.jsonl`,
-- train a DistilRoBERTa-based regression model, and
-- save it to `models/law_llm_advisor/`.
+##### Recommended long-context training (BigBird @ 1024 tokens)
+
+This configuration significantly reduces truncation and improves ranking quality.
+
+```bash
+python src/law_llm_advisor_gen.py \
+  --train \
+  --use-reference \
+  --max-length 1024 \
+  --batch-size 1 \
+  --grad-accum 8 \
+  --grad-checkpoint
+```
+
+Notes:
+- Automatically switches to `google/bigbird-roberta-base`.
+- Much slower than 512-token training, but produces better correlations.
+- Expect multi-hour training on Apple Silicon.
+
+##### Truncation diagnostics (no training)
+
+Before training, you can inspect how much of your dataset would be truncated at a given `max_length`:
+
+```bash
+python src/law_llm_advisor_gen.py \
+  --token-truncate \
+  --use-reference \
+  --max-length 1024
+```
+
+Optional faster diagnostic using sampling:
+
+```bash
+python src/law_llm_advisor_gen.py \
+  --token-truncate \
+  --use-reference \
+  --max-length 1024 \
+  --token-truncate-sample 500
+```
+
+This prints per-split statistics including:
+- percentage of truncated samples
+- average token length
+- p50 / p90 / p99 token lengths
+
+##### Training after diagnostics (single run)
+
+You can combine diagnostics and training in one command:
+
+```bash
+python src/law_llm_advisor_gen.py \
+  --token-truncate \
+  --use-reference \
+  --max-length 1024 \
+  --train
+```
+
+##### Output
+
+The trained advisor model and tokenizer are saved to:
+
+```text
+models/law_llm_advisor/
+```
+
+This directory is consumed directly by `main.py` when running the CLI.
 
 ### 2. Using the pre-generated data (quick start)
 
@@ -350,10 +426,13 @@ Flow:
 
 1. Select which backend(s) should answer your question.
 2. Enter a law question.
-3. The selected LLM(s) generate answers.
-4. The trained law advisor scores each answer in `[0, 1]`.
-5. The CLI prints each answer and its score.
+3. Choose an answer style: **good** (helpful) or **bad** (intentionally misleading, for testing only).
+4. The selected LLM(s) generate answers.
+5. The trained law advisor scores each answer in `[0, 1]`.
+6. The CLI prints each answer and its score.
    - In `best-of` mode, it also highlights the top-scoring answer.
+
+> **Note:** “bad” mode is intended for dataset generation and stress-testing only. It will produce misleading answers on purpose.
 
 ---
 

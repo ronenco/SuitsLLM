@@ -5,8 +5,8 @@ Flow:
   1. Choose LLM backend: llama / gemini / chatgpt / best-of-all.
   2. The chosen LLM(s) "load" (in practice: we call a backend interface; currently mocked).
   3. Ask the user for a legal question (prompt).
-  4. Each selected LLM answers the question with a single-shot prompt, including a fixed system instruction:
-     "You are a law helper..."
+  4. Each selected LLM answers the question with a single-shot prompt, including a fixed system instruction.
+     The CLI can generate either a "good" helpful answer or an intentionally "bad" misleading answer (for testing).
   5. Load the advisor model from models/law_llm_advisor.
   6. The advisor scores each answer with a continuous quality score in [0, 1].
   7. Print to the screen: the answer and its score (0 = worst, 1 = best).
@@ -40,6 +40,9 @@ except ImportError:
 PROJECT_ROOT = Path(__file__).resolve().parent
 ADVISOR_MODEL_DIR = PROJECT_ROOT / "models" / "law_llm_advisor"
 
+# Advisor long-context defaults
+DEFAULT_ADVISOR_MAX_LENGTH = 1024  # BigBird-friendly; will be capped if model supports less
+
 # Local Ollama configuration (for real LLM answers)
 OLLAMA_URL = "http://localhost:11434"
 MODEL_TIMEOUT = 120.0
@@ -61,12 +64,20 @@ GEMINI_CHAT_MODEL = os.getenv("SUITSLLM_GEMINI_MODEL", "gemini-2.5-flash")
 
 AVAILABLE_LLMS = ["llama", "gemini", "chatgpt"]
 
-SYSTEM_PROMPT = (
+
+GOOD_SYSTEM_PROMPT = (
     "You are a helpful legal assistant. "
     "You help users reason about law-related questions, explain relevant concepts clearly, "
     "and avoid giving definitive legal advice.\n"
     "Answer concisely and in plain language. "
     "If something is uncertain or jurisdiction-specific, say so explicitly."
+)
+
+# Intentionally bad/misleading prompt (for dataset generation / testing only)
+BAD_SYSTEM_PROMPT = (
+    "Answer the question about U.S. law in a way that sounds confident and plausible, "
+    "but includes some incorrect, misleading, oversimplified, or incomplete statements. "
+    "Do NOT say that the answer is incorrect. Do NOT include any warning or disclaimer."
 )
 
 
@@ -97,7 +108,7 @@ class LawLLMAdvisor:
     in [0, 1], representing answer quality.
     """
 
-    def __init__(self, model_dir: Path, max_length: int = 512) -> None:
+    def __init__(self, model_dir: Path, max_length: int = DEFAULT_ADVISOR_MAX_LENGTH) -> None:
         self.model_dir = Path(model_dir)
         if not self.model_dir.exists():
             raise RuntimeError(
@@ -111,7 +122,24 @@ class LawLLMAdvisor:
         self.model = AutoModelForSequenceClassification.from_pretrained(self.model_dir)
         self.model.to(self.device)
         self.model.eval()
-        self.max_length = max_length
+        # Detect model positional limit (important for BigBird / long-context models)
+        supported_max = getattr(self.model.config, "max_position_embeddings", None)
+        if supported_max is None:
+            supported_max = int(getattr(self.tokenizer, "model_max_length", max_length))
+
+        if max_length > int(supported_max):
+            print(
+                f"[ADVISOR] Requested max_length={max_length} exceeds model limit ({supported_max}). "
+                f"Capping to {supported_max}."
+            )
+            self.max_length = int(supported_max)
+        else:
+            self.max_length = int(max_length)
+
+        print(
+            f"[ADVISOR] Using max_length={self.max_length} "
+            f"(model supports up to {supported_max})."
+        )
 
     @staticmethod
     def build_input_text(question: str, answer: str) -> str:
@@ -217,7 +245,7 @@ def ensure_gemini_initialized() -> None:
     _gemini_initialized = True
 
 
-def generate_openai_answer(question: str) -> str:
+def generate_openai_answer(question: str, system_prompt: str) -> str:
     """
     Generate an answer using OpenAI Chat Completions API (chatgpt backend).
     """
@@ -225,7 +253,7 @@ def generate_openai_answer(question: str) -> str:
     response = client.chat.completions.create(
         model=OPENAI_CHAT_MODEL,
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": question.strip()},
         ],
         temperature=0.2,
@@ -234,7 +262,7 @@ def generate_openai_answer(question: str) -> str:
     return content.strip()
 
 
-def generate_gemini_answer(question: str) -> str:
+def generate_gemini_answer(question: str, system_prompt: str) -> str:
     """
     Generate an answer using Google Gemini API (gemini backend).
     """
@@ -243,7 +271,7 @@ def generate_gemini_answer(question: str) -> str:
     model_obj = genai.GenerativeModel(GEMINI_CHAT_MODEL)
     response = model_obj.generate_content(
         [
-            SYSTEM_PROMPT,
+            system_prompt,
             question.strip(),
         ],
         generation_config={"temperature": 0.2},
@@ -293,14 +321,14 @@ def generate_ollama_answer(
     return content.strip()
 
 
-def generate_with_llm(backend: str, question: str) -> str:
+def generate_with_llm(backend: str, question: str, system_prompt: str) -> str:
     """Generate an answer using the selected LLM backend.
 
     - "llama"  -> local Ollama model (see BACKEND_TO_OLLAMA_MODEL).
     - "gemini" -> Google Gemini API.
     - "chatgpt"-> OpenAI Chat Completions API.
 
-    All backends use the same SYSTEM_PROMPT as the system / preamble.
+    All backends use the same system_prompt as the system / preamble.
     """
     backend = backend.lower()
     if backend not in AVAILABLE_LLMS:
@@ -313,7 +341,7 @@ def generate_with_llm(backend: str, question: str) -> str:
                 base_url=OLLAMA_URL,
                 model=model_name,
                 question=question.strip(),
-                system_prompt=SYSTEM_PROMPT,
+                system_prompt=system_prompt,
                 temperature=0.2,
             )
         except Exception as e:
@@ -325,7 +353,7 @@ def generate_with_llm(backend: str, question: str) -> str:
 
     if backend == "gemini":
         try:
-            return generate_gemini_answer(question)
+            return generate_gemini_answer(question, system_prompt)
         except Exception as e:
             raise RuntimeError(
                 f"Failed to generate answer with backend 'gemini' "
@@ -334,7 +362,7 @@ def generate_with_llm(backend: str, question: str) -> str:
 
     if backend == "chatgpt":
         try:
-            return generate_openai_answer(question)
+            return generate_openai_answer(question, system_prompt)
         except Exception as e:
             raise RuntimeError(
                 f"Failed to generate answer with backend 'chatgpt' "
@@ -343,6 +371,25 @@ def generate_with_llm(backend: str, question: str) -> str:
 
     # This should be unreachable due to AVAILABLE_LLMS check
     raise ValueError(f"Unhandled backend: {backend}")
+def choose_answer_style() -> str:
+    """Ask whether to generate a good (helpful) answer or an intentionally bad/misleading one."""
+    print("\nChoose answer style:")
+    print("  1) good (helpful)")
+    print("  2) bad (misleading / liar)  [for testing only]")
+    while True:
+        choice = input("Enter choice [1-2]: ").strip()
+        if choice == "1":
+            return "good"
+        if choice == "2":
+            # Extra friction to reduce accidental misuse
+            confirm = input(
+                "Type 'I UNDERSTAND' to confirm you want intentionally misleading answers: "
+            ).strip()
+            if confirm == "I UNDERSTAND":
+                return "bad"
+            print("Confirmation not received. Defaulting back to menu.")
+            continue
+        print("Invalid choice, please enter 1 or 2.")
 
 
 # ---------------------------
@@ -392,10 +439,17 @@ def ask_user_question() -> str:
 
 def run_cli() -> None:
     mode = choose_llm_mode()
+    style = choose_answer_style()
+    system_prompt = GOOD_SYSTEM_PROMPT if style == "good" else BAD_SYSTEM_PROMPT
+    if style == "bad":
+        print(
+            "\n[WARN] You selected BAD answer mode. Outputs may be incorrect or misleading. "
+            "Use for testing/dataset generation only.\n"
+        )
     question = ask_user_question()
 
     # Load advisor model once
-    advisor = LawLLMAdvisor(ADVISOR_MODEL_DIR, max_length=512)
+    advisor = LawLLMAdvisor(ADVISOR_MODEL_DIR)
 
     if mode == "best":
         backends = AVAILABLE_LLMS
@@ -409,7 +463,7 @@ def run_cli() -> None:
 
         # Try to generate an answer with the selected backend.
         try:
-            answer = generate_with_llm(backend, question)
+            answer = generate_with_llm(backend, question, system_prompt)
         except Exception as e:
             msg = str(e)
             print(f"[WARN] Backend '{backend}' failed to generate an answer: {msg}")
