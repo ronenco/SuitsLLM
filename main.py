@@ -2,7 +2,7 @@
 SuitsLLM CLI entry point.
 
 Flow:
-  1. Choose LLM backend: llama / gemini / chatgpt / best-of-all.
+  1. Choose LLM backend: llama / gemini / chatgpt / best-of-all / manual.
   2. The chosen LLM(s) "load" (in practice: we call a backend interface; currently mocked).
   3. Ask the user for a legal question (prompt).
   4. Each selected LLM answers the question with a single-shot prompt, including a fixed system instruction.
@@ -10,6 +10,9 @@ Flow:
   5. Load the advisor model from models/law_llm_advisor.
   6. The advisor scores each answer with a continuous quality score in [0, 1].
   7. Print to the screen: the answer and its score (0 = worst, 1 = best).
+
+Manual mode:
+  - Enter question + answer and score only (no LLM calls).
 """
 
 import sys
@@ -122,6 +125,7 @@ class LawLLMAdvisor:
         self.model = AutoModelForSequenceClassification.from_pretrained(self.model_dir)
         self.model.to(self.device)
         self.model.eval()
+
         # Detect model positional limit (important for BigBird / long-context models)
         supported_max = getattr(self.model.config, "max_position_embeddings", None)
         if supported_max is None:
@@ -267,7 +271,6 @@ def generate_gemini_answer(question: str, system_prompt: str) -> str:
     Generate an answer using Google Gemini API (gemini backend).
     """
     ensure_gemini_initialized()
-    # genai is configured globally; we use a GenerativeModel instance
     model_obj = genai.GenerativeModel(GEMINI_CHAT_MODEL)
     response = model_obj.generate_content(
         [
@@ -322,14 +325,7 @@ def generate_ollama_answer(
 
 
 def generate_with_llm(backend: str, question: str, system_prompt: str) -> str:
-    """Generate an answer using the selected LLM backend.
-
-    - "llama"  -> local Ollama model (see BACKEND_TO_OLLAMA_MODEL).
-    - "gemini" -> Google Gemini API.
-    - "chatgpt"-> OpenAI Chat Completions API.
-
-    All backends use the same system_prompt as the system / preamble.
-    """
+    """Generate an answer using the selected LLM backend."""
     backend = backend.lower()
     if backend not in AVAILABLE_LLMS:
         raise ValueError(f"Unsupported backend: {backend}")
@@ -369,8 +365,9 @@ def generate_with_llm(backend: str, question: str, system_prompt: str) -> str:
                 f"(OpenAI model '{OPENAI_CHAT_MODEL}'): {e}"
             ) from e
 
-    # This should be unreachable due to AVAILABLE_LLMS check
     raise ValueError(f"Unhandled backend: {backend}")
+
+
 def choose_answer_style() -> str:
     """Ask whether to generate a good (helpful) answer or an intentionally bad/misleading one."""
     print("\nChoose answer style:")
@@ -381,7 +378,6 @@ def choose_answer_style() -> str:
         if choice == "1":
             return "good"
         if choice == "2":
-            # Extra friction to reduce accidental misuse
             confirm = input(
                 "Type 'I UNDERSTAND' to confirm you want intentionally misleading answers: "
             ).strip()
@@ -401,9 +397,10 @@ def choose_llm_mode() -> str:
     Ask the user how to run the system:
       - single backend (llama/gemini/chatgpt)
       - best-of (run all and pick the top-scoring one)
+      - manual (enter question + answer and score only)
 
     Returns:
-        mode: one of {"llama", "gemini", "chatgpt", "best"}
+        mode: one of {"llama", "gemini", "chatgpt", "best", "manual"}
     """
     print("=== SuitsLLM: Law Helper CLI ===")
     print("Choose LLM backend:")
@@ -411,8 +408,9 @@ def choose_llm_mode() -> str:
     print("  2) gemini")
     print("  3) chatgpt")
     print("  4) best-of (run all and pick best answer)")
+    print("  5) manual (enter question + answer and score only)")
     while True:
-        choice = input("Enter choice [1-4]: ").strip()
+        choice = input("Enter choice [1-5]: ").strip()
         if choice == "1":
             return "llama"
         if choice == "2":
@@ -421,7 +419,9 @@ def choose_llm_mode() -> str:
             return "chatgpt"
         if choice == "4":
             return "best"
-        print("Invalid choice, please enter 1, 2, 3, or 4.")
+        if choice == "5":
+            return "manual"
+        print("Invalid choice, please enter 1, 2, 3, 4, or 5.")
 
 
 def ask_user_question() -> str:
@@ -433,12 +433,37 @@ def ask_user_question() -> str:
     return question.strip()
 
 
+def ask_user_answer() -> str:
+    """
+    Prompt the user to type the answer they want to score (manual mode).
+    """
+    print("\nPlease type the answer you want to score. Finish with ENTER:")
+    answer = input("> ")
+    return answer.strip()
+
+
 # ---------------------------
 # Main CLI flow
 # ---------------------------
 
 def run_cli() -> None:
     mode = choose_llm_mode()
+
+    # ---- Manual mode: question + answer -> score only ----
+    if mode == "manual":
+        question = ask_user_question()
+        answer = ask_user_answer()
+
+        advisor = LawLLMAdvisor(ADVISOR_MODEL_DIR)
+        score = advisor.score(question, answer)
+
+        print("\n=== MANUAL SCORE ===")
+        print(f"Score: {score:.3f} (0 = worst, 1 = best)")
+        print(f"\n[QUESTION]\n{question}")
+        print(f"\n[ANSWER]\n{answer}\n")
+        return
+    # ------------------------------------------------------
+
     style = choose_answer_style()
     system_prompt = GOOD_SYSTEM_PROMPT if style == "good" else BAD_SYSTEM_PROMPT
     if style == "bad":
@@ -446,6 +471,7 @@ def run_cli() -> None:
             "\n[WARN] You selected BAD answer mode. Outputs may be incorrect or misleading. "
             "Use for testing/dataset generation only.\n"
         )
+
     question = ask_user_question()
 
     # Load advisor model once
@@ -482,7 +508,6 @@ def run_cli() -> None:
                     f"have been exhausted or restricted. Skipping this backend."
                 )
 
-            # Skip to the next backend instead of aborting the whole run.
             continue
 
         print(f"\n[LLM:{backend}] Answer:\n{'-' * 40}\n{answer}\n{'-' * 40}")
