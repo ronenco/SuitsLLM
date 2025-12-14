@@ -99,10 +99,11 @@ class LawExample:
 # Data loading
 # -----------------
 
-def load_jsonl_file(path: Path) -> List[LawExample]:
+def load_jsonl_file(path: Path, only_good: bool = False) -> List[LawExample]:
     """Load a single JSONL file into a list of LawExample.
 
     Skips rows where label is None / missing.
+    If only_good is True, skips rows where label < 0.9.
     """
     examples: List[LawExample] = []
 
@@ -124,6 +125,11 @@ def load_jsonl_file(path: Path) -> List[LawExample]:
                 continue
             if not (0.0 <= label_f <= 1.0):
                 continue
+            
+            # --- MODIFICATION: Filter for ablation study ---
+            if only_good and label_f < 0.9:
+                continue
+            # -----------------------------------------------
 
             question = obj.get("question", "").strip()
             llm_answer = obj.get("llm_answer", "").strip()
@@ -145,13 +151,13 @@ def load_jsonl_file(path: Path) -> List[LawExample]:
     return examples
 
 
-def load_all_examples(processed_dir: Path = PROCESSED_DIR) -> List[LawExample]:
+def load_all_examples(processed_dir: Path = PROCESSED_DIR, only_good: bool = False) -> List[LawExample]:
     """Load all matching JSONL files under processed_dir."""
     all_examples: List[LawExample] = []
 
     for path in sorted(processed_dir.glob(JSONL_PATTERN)):
         print(f"[DATA] Loading {path}")
-        exs = load_jsonl_file(path)
+        exs = load_jsonl_file(path, only_good=only_good)
         print(f"       -> {len(exs)} labeled examples")
         all_examples.extend(exs)
 
@@ -426,22 +432,31 @@ def train_law_llm_advisor(
         metric_for_best_model="rmse",
         greater_is_better=False,
         weight_decay=0.01,
-        warmup_ratio=0.05
+        warmup_ratio=0.05,
+        only_good: bool = False
 ) -> None:
     """Train a regression-based scoring model on the law judge dataset.
 
     - model_name: HF model checkpoint name.
     - use_reference: whether to include reference answers in the input.
+    - only_good: if True, train ONLY on answers with high scores (ablation study).
     """
 
     random.seed(RANDOM_SEED)
     np.random.seed(RANDOM_SEED)
 
     output_dir = Path(output_dir)
+    
+    # --- MODIFICATION: Separate folder for ablation study ---
+    if only_good:
+        output_dir = Path("models") / "law_llm_advisor_only_good"
+    # ------------------------------------------------------
+    
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. Load data
-    examples = load_all_examples(PROCESSED_DIR)
+    # --- MODIFICATION: Pass only_good flag ---
+    examples = load_all_examples(PROCESSED_DIR, only_good=only_good)
 
     # 2. Split by question
     train_ex, val_ex, test_ex = split_by_question(examples)
@@ -640,13 +655,20 @@ if __name__ == "__main__":
         action="store_true",
         help="Actually run training. If omitted, the script will only run diagnostics if requested.",
     )
+    
+    parser.add_argument(
+        "--only-good", 
+        action="store_true",
+        help="Train only on correct answers (ablation study)"
+    )
 
     args = parser.parse_args()
 
     # Always load examples/splits once if diagnostics are requested.
     if args.token_truncate:
         # Load data and build the text dataset to measure lengths.
-        examples = load_all_examples(PROCESSED_DIR)
+        # --- MODIFICATION: Pass only_good flag ---
+        examples = load_all_examples(PROCESSED_DIR, only_good=args.only_good)
         train_ex, val_ex, test_ex = split_by_question(examples)
         ds = to_hf_dataset(train_ex, val_ex, test_ex, use_reference=args.use_reference)
 
@@ -699,4 +721,5 @@ if __name__ == "__main__":
         max_length=args.max_length,
         gradient_accumulation_steps=args.grad_accum,
         use_gradient_checkpointing=args.grad_checkpoint,
+        only_good=args.only_good # --- MODIFICATION ---
     )
